@@ -1,0 +1,346 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Firewatch — CP2</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/p5.js/1.9.4/p5.min.js"></script>
+<script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+<style>
+  :root {
+    --bg: #0d0b14; --panel: #161320; --ember: #ff5b2e;
+    --ash: #6b6478; --safe: #2ee08a; --ink: #f4f0ff;
+  }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body {
+    background:
+      radial-gradient(1200px 600px at 70% -10%, rgba(255,91,46,0.10), transparent 60%),
+      radial-gradient(900px 500px at 10% 110%, rgba(46,224,138,0.06), transparent 55%),
+      var(--bg);
+    color: var(--ink); font-family: "Courier New", monospace;
+    min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; padding: 24px;
+  }
+  h1 {
+    font-size: 28px; letter-spacing: 6px; font-weight: 700;
+    text-transform: uppercase; margin-bottom: 4px;
+    background: linear-gradient(90deg, var(--ember), #ffb05b);
+    -webkit-background-clip: text; background-clip: text; color: transparent;
+  }
+  .sub { color: var(--ash); font-size: 12px; letter-spacing: 2px; margin-bottom: 18px; }
+  #stage { position: relative; line-height: 0; border-radius: 14px; overflow: hidden;
+           box-shadow: 0 24px 60px rgba(0,0,0,0.55), inset 0 0 0 1px rgba(255,255,255,0.06); }
+  .hud { display: flex; gap: 14px; margin: 16px 0 4px; flex-wrap: wrap; justify-content: center; }
+  .chip {
+    background: var(--panel); border: 1px solid rgba(255,255,255,0.07);
+    padding: 10px 16px; border-radius: 999px; font-size: 13px; letter-spacing: 1px;
+  }
+  .chip b { color: var(--ember); }
+  .chip.safe b { color: var(--safe); }
+  .legend { color: var(--ash); font-size: 11px; letter-spacing: 1px; margin-top: 10px; text-align:center; line-height:1.7;}
+  .legend kbd { background:#241f30; border:1px solid #3a3348; border-radius:5px; padding:1px 7px; color:var(--ink); }
+  button.act {
+    background: linear-gradient(135deg, var(--ember), #ff8a3d); color: #1a0d08;
+    border: none; padding: 9px 18px; border-radius: 10px; font-weight: 700;
+    letter-spacing: 1px; cursor: pointer; font-family: inherit; font-size: 12px;
+  }
+  button.act:hover { filter: brightness(1.08); }
+  button.act.serial { background: linear-gradient(135deg, #4a9eff, #7bc0ff); color:#04121f; }
+</style>
+</head>
+<body>
+  <h1>Firewatch</h1>
+  <div class="sub">CP2 · PINCH TO IGNITE · PAD TO EXTINGUISH</div>
+  <div id="stage"></div>
+  <div class="hud">
+    <div class="chip">FIRES <b id="fireCount">0</b></div>
+    <div class="chip safe">STATUS <b id="status">PLAYING</b></div>
+    <div class="chip">HAND <b id="hand">—</b></div>
+    <div class="chip">GRID <b id="serialState">OFFLINE</b></div>
+    <button class="act serial" onclick="connectSerial()">CONNECT GRID</button>
+    <button class="act" onclick="resetBoard()">RESET BOARD</button>
+  </div>
+  <div class="legend">
+    <kbd>pinch</kbd> over a cell to set a fire · press a <kbd>pad</kbd> (or <kbd>click</kbd> / keys <kbd>1-9</kbd>) to extinguish<br>
+    each fire has a <b>2s</b> fuse — if not put out, it spreads to up/down/left/right neighbors, each with its own fuse<br>
+    when all 9 cells are red you lose: board flashes red for 3s, then resets to green
+  </div>
+
+<script>
+/* ============================================================
+   FIREWATCH — CP2 (p5 + ml5 handPose + Web Serial)
+   Game brain + serial layer talking to the ESP32-S3:
+   reads {"btn":i} pad presses, sends {cmd:set/all/flash}
+   so the 3 NeoPixel row-strips mirror the screen.
+   ============================================================ */
+
+// ---- tunables -------------------------------------------------
+const GRID = 3;
+const FUSE_MS = 2000;
+const FLASH_MS = 3000;
+const PINCH_ON = 0.045;
+const PINCH_OFF = 0.075;
+const CAM_W = 640, CAM_H = 480;
+
+const GREEN = 'green', RED = 'red';
+
+let cells = [];
+let gameState = 'playing';
+let flashUntil = 0;
+
+let handPose, video, hands = [];
+let pinching = false;
+
+// ---- serial ---------------------------------------------------
+let serialPort = null, serialWriter = null, serialReader = null;
+let serialBuf = '';
+let serialOK = false;
+
+function setup() {
+  const cnv = createCanvas(CAM_W, CAM_H);
+  cnv.parent('stage');
+  video = createCapture(VIDEO, () => {});
+  video.size(CAM_W, CAM_H);
+  video.hide();
+  handPose = ml5.handPose({ flipped: true }, () => {
+    handPose.detectStart(video, (results) => { hands = results; });
+  });
+  resetBoard();
+  textFont('Courier New');
+}
+
+function resetBoard() {
+  cells = [];
+  for (let i = 0; i < GRID * GRID; i++) cells.push({ state: GREEN, fuseAt: 0 });
+  gameState = 'playing';
+  flashUntil = 0;
+  syncHUD();
+  pushAllToGrid();          // mirror the cleared board to the strips
+}
+window.resetBoard = resetBoard;
+
+// ---- geometry -------------------------------------------------
+function cellW() { return width / GRID; }
+function cellH() { return height / GRID; }
+function cellIndexAt(px, py) {
+  if (px < 0 || py < 0 || px >= width || py >= height) return -1;
+  const c = Math.floor(px / cellW());
+  const r = Math.floor(py / cellH());
+  return r * GRID + c;
+}
+function neighbors(i) {
+  const r = Math.floor(i / GRID), c = i % GRID;
+  const out = [];
+  if (r > 0) out.push(i - GRID);
+  if (r < GRID - 1) out.push(i + GRID);
+  if (c > 0) out.push(i - 1);
+  if (c < GRID - 1) out.push(i + 1);
+  return out;
+}
+
+// ---- game actions --------------------------------------------
+function igniteCell(i) {
+  if (gameState !== 'playing' || i < 0) return;
+  cells[i].state = RED;
+  cells[i].fuseAt = millis() + FUSE_MS;
+  pushCellToGrid(i);
+  syncHUD();
+}
+function extinguishCell(i) {
+  if (gameState !== 'playing' || i < 0) return;
+  if (cells[i].state === RED) {
+    cells[i].state = GREEN;
+    cells[i].fuseAt = 0;
+    pushCellToGrid(i);
+    syncHUD();
+  }
+}
+function spreadFrom(i) {
+  const now = millis();
+  for (const n of neighbors(i)) {
+    if (cells[n].state === GREEN) {
+      cells[n].state = RED;
+      cells[n].fuseAt = now + FUSE_MS;
+      pushCellToGrid(n);
+    }
+  }
+}
+
+function tickFires() {
+  if (gameState !== 'playing') return;
+  const now = millis();
+  for (let i = 0; i < cells.length; i++) {
+    if (cells[i].state === RED && cells[i].fuseAt !== 0 && now >= cells[i].fuseAt) {
+      cells[i].fuseAt = 0;
+      spreadFrom(i);
+    }
+  }
+  if (cells.every(c => c.state === RED)) {
+    gameState = 'lost';
+    flashUntil = now + FLASH_MS;
+    pushFlashToGrid();
+  }
+  syncHUD();
+}
+
+// ---- pinch detection -----------------------------------------
+function detectPinch() {
+  document.getElementById('hand').textContent = hands.length ? 'DETECTED' : '—';
+  if (!hands.length) { pinching = false; return; }
+  const h = hands[0];
+  const idx = h.keypoints[8], thumb = h.keypoints[4];
+  if (!idx || !thumb) return;
+  const dx = idx.x - thumb.x, dy = idx.y - thumb.y;
+  const dist = Math.hypot(dx, dy) / width;
+  if (!pinching && dist < PINCH_ON) {
+    pinching = true;
+    const mid = { x: (idx.x + thumb.x) / 2, y: (idx.y + thumb.y) / 2 };
+    igniteCell(cellIndexAt(mid.x, mid.y));
+  } else if (pinching && dist > PINCH_OFF) {
+    pinching = false;
+  }
+}
+
+// ---- render ---------------------------------------------------
+function draw() {
+  push();
+  translate(width, 0); scale(-1, 1);
+  image(video, 0, 0, width, height);
+  pop();
+  noStroke(); fill(13, 11, 20, 90); rect(0, 0, width, height);
+
+  detectPinch();
+  tickFires();
+
+  const flashing = gameState === 'lost' && millis() < flashUntil;
+  const flashOn = flashing && (Math.floor(millis() / 250) % 2 === 0);
+  if (gameState === 'lost' && millis() >= flashUntil) resetBoard();
+
+  for (let i = 0; i < cells.length; i++) {
+    const r = Math.floor(i / GRID), c = i % GRID;
+    const x = c * cellW(), y = r * cellH();
+    let col;
+    if (flashing) col = flashOn ? color(255, 60, 30) : color(40, 20, 18);
+    else col = cells[i].state === RED ? color(255, 91, 46) : color(46, 224, 138);
+
+    noFill();
+    drawingContext.shadowBlur = 28;
+    drawingContext.shadowColor = (cells[i].state === RED || (flashing && flashOn))
+      ? 'rgba(255,91,46,0.8)' : 'rgba(46,224,138,0.5)';
+    stroke(col); strokeWeight(3);
+    rect(x + 8, y + 8, cellW() - 16, cellH() - 16, 14);
+    drawingContext.shadowBlur = 0;
+
+    if (cells[i].state === RED && cells[i].fuseAt > millis()) {
+      const remain = (cells[i].fuseAt - millis()) / FUSE_MS;
+      stroke(255, 200, 80); strokeWeight(4); noFill();
+      arc(x + cellW()/2, y + cellH()/2, cellW()*0.34, cellH()*0.34,
+          -HALF_PI, -HALF_PI + remain * TWO_PI);
+    }
+    noStroke(); fill(255, 70); textSize(12); textAlign(LEFT, TOP);
+    text(i, x + 14, y + 14);
+  }
+
+  if (hands.length) {
+    const h = hands[0];
+    const idx = h.keypoints[8], thumb = h.keypoints[4];
+    if (idx && thumb) {
+      const mx = (idx.x + thumb.x) / 2, my = (idx.y + thumb.y) / 2;
+      noStroke(); fill(pinching ? color(255, 91, 46) : color(244, 240, 255, 220));
+      circle(mx, my, pinching ? 22 : 14);
+      stroke(255, 120); strokeWeight(1); noFill(); circle(mx, my, 30);
+    }
+  }
+}
+
+// ---- input fallbacks -----------------------------------------
+function mousePressed() { extinguishCell(cellIndexAt(mouseX, mouseY)); }
+function keyPressed() { if (key >= '1' && key <= '9') extinguishCell(int(key) - 1); }
+
+// ---- HUD ------------------------------------------------------
+function syncHUD() {
+  const fc = cells.filter(c => c.state === RED).length;
+  document.getElementById('fireCount').textContent = fc;
+  const s = document.getElementById('status');
+  s.textContent = gameState === 'lost' ? 'BURNED!' : 'PLAYING';
+  s.style.color = gameState === 'lost' ? 'var(--ember)' : 'var(--safe)';
+}
+
+/* ============================================================
+   WEB SERIAL LAYER  — talks to the ESP32-S3 firmware
+   IN : {"btn":i}  -> extinguishCell(i)
+   OUT: {"cmd":"set","cell":i,"r":..,"g":..,"b":..}
+        {"cmd":"flash", ...}
+   ============================================================ */
+const COL_FIRE  = { r: 255, g: 40, b: 0 };   // red cell on the strips
+const COL_GREEN = { r: 0,   g: 22, b: 8 };   // safe cell on the strips (dark green)
+const COL_OFF   = { r: 0,   g: 0,  b: 0 };
+
+async function connectSerial() {
+  if (!('serial' in navigator)) {
+    setSerialState('NO WEBSERIAL');
+    alert('Web Serial needs Chrome or Edge (desktop).');
+    return;
+  }
+  try {
+    serialPort = await navigator.serial.requestPort();
+    await serialPort.open({ baudRate: 115200 });
+    serialWriter = serialPort.writable.getWriter();
+    serialOK = true;
+    setSerialState('ONLINE');
+    readLoop();
+    pushAllToGrid();            // sync current board to the strips on connect
+  } catch (e) {
+    setSerialState('OFFLINE');
+    console.error('Serial connect failed:', e);
+  }
+}
+window.connectSerial = connectSerial;
+
+async function readLoop() {
+  const dec = new TextDecoder();
+  try {
+    serialReader = serialPort.readable.getReader();
+    while (true) {
+      const { value, done } = await serialReader.read();
+      if (done) break;
+      serialBuf += dec.decode(value);
+      let nl;
+      while ((nl = serialBuf.indexOf('\n')) >= 0) {
+        const line = serialBuf.slice(0, nl).trim();
+        serialBuf = serialBuf.slice(nl + 1);
+        if (!line) continue;
+        try {
+          const msg = JSON.parse(line);
+          if (typeof msg.btn === 'number') extinguishCell(msg.btn);
+        } catch (_) { /* ignore non-JSON / hello line */ }
+      }
+    }
+  } catch (e) {
+    setSerialState('OFFLINE');
+    console.error('Serial read ended:', e);
+  }
+}
+
+async function sendToGrid(obj) {
+  if (!serialOK || !serialWriter) return;
+  try { await serialWriter.write(new TextEncoder().encode(JSON.stringify(obj) + '\n')); }
+  catch (_) {}
+}
+function pushCellToGrid(i) {
+  const c = cells[i].state === RED ? COL_FIRE : COL_GREEN;
+  sendToGrid({ cmd: 'set', cell: i, r: c.r, g: c.g, b: c.b });
+}
+function pushAllToGrid() {
+  for (let i = 0; i < cells.length; i++) pushCellToGrid(i);
+}
+function pushFlashToGrid() {
+  sendToGrid({ cmd: 'flash', r: 255, g: 0, b: 0 });
+}
+function setSerialState(t) {
+  const el = document.getElementById('serialState');
+  if (el) el.textContent = t;
+}
+</script>
+</body>
+</html>
